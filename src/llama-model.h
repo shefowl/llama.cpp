@@ -255,6 +255,18 @@ struct llama_layer_switch_lora {
     struct ggml_tensor * b_down = nullptr;
 };
 
+// LLAMA_MOE_HOT: copies of the most used routed experts in device memory
+// the full expert tensors stay where they are and serve the cold experts
+struct llama_moe_hot {
+    struct ggml_tensor * up   = nullptr; // [n_embd, n_ff, n_hot]
+    struct ggml_tensor * gate = nullptr; // [n_embd, n_ff, n_hot]
+    struct ggml_tensor * down = nullptr; // [n_ff, n_embd, n_hot]
+
+    std::vector<int32_t> slot;      // expert id -> slot in the hot tensors, -1 if cold
+    std::vector<int32_t> cold_fill; // cold experts used as zero-weight fillers when the cold part may run on the GPU
+    std::vector<float>   score;     // decayed use count per expert (LLAMA_MOE_HOT_ADAPT)
+};
+
 struct llama_layer {
     // normalization
     struct ggml_tensor * attn_norm       = nullptr;
@@ -348,6 +360,9 @@ struct llama_layer {
     struct ggml_tensor * ffn_gate_exps_s   = nullptr;
     struct ggml_tensor * ffn_down_exps_s   = nullptr;
     struct ggml_tensor * ffn_up_exps_s     = nullptr;
+
+    // ff MoE hot expert copies (LLAMA_MOE_HOT), owned by llama_model::moe_hot
+    const struct llama_moe_hot * moe_hot = nullptr;
 
     // ff MoE latent proj
     struct ggml_tensor * ffn_latent_down = nullptr;
@@ -683,6 +698,17 @@ struct llama_model {
 
     std::vector<llama_layer> layers;
 
+    // LLAMA_MOE_HOT: one entry per layer, empty when unused
+    // mutable: use counts and expert swaps change at run time (LLAMA_MOE_HOT_ADAPT)
+    mutable std::vector<llama_moe_hot> moe_hot;
+    mutable int64_t moe_hot_tokens = 0; // tokens since the last adaptation step
+    mutable bool    moe_hot_locked = false; // cold experts are locked in RAM (LLAMA_MOE_HOT_MLOCK)
+
+    // LLAMA_MOE_HOT_ADAPT=<tokens>: true when an adaptation step is due before this batch
+    bool moe_hot_adapt_due(int64_t n_tokens) const;
+    // move the most used cold experts into the slots of the least used hot ones; the backends must be idle
+    void moe_hot_adapt() const;
+
     //Dense linear projections for SentenceTransformers models like embeddinggemma
     // For Sentence Transformers models structure see
     // https://sbert.net/docs/sentence_transformer/usage/custom_models.html#structure-of-sentence-transformer-models
@@ -808,6 +834,9 @@ struct llama_model_base : public llama_model {
     void load_hparams(llama_model_loader & ml) override;
     void load_vocab  (llama_model_loader & ml) override;
     bool load_tensors(llama_model_loader & ml) override;
+
+    // LLAMA_MOE_HOT=<file>: copy the listed routed experts of each layer to the GPU
+    void load_moe_hot();
 
     // model must define these
     void load_arch_hparams(llama_model_loader & ml) override = 0;

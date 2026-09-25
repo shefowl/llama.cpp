@@ -1659,6 +1659,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -1;
     }
 
+    // LLAMA_MOE_HOT_ADAPT: swap hot experts while no graph runs
+    if (model.moe_hot_adapt_due(batch_inp.n_tokens)) {
+        ggml_backend_sched_synchronize(sched.get());
+        model.moe_hot_adapt();
+    }
+
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
 

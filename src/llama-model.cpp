@@ -35,9 +35,11 @@
 #ifndef _WIN32
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #endif
 #include <cstring>
 #include <cmath>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <numeric>
@@ -1813,13 +1815,388 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+#ifdef MADV_PAGEOUT
+    // hot mode: the CPU never reads the weights that went to a GPU, so drop their pages from the page cache
+    const char * hot_path = getenv("LLAMA_MOE_HOT");
+    if (hot_path && hot_path[0] != '\0') {
+        for (const auto & [name, w] : ml.weights_map) {
+            const ggml_tensor * t = get_tensor(name.c_str());
+            if (!t || !t->buffer || ggml_backend_buffer_is_host(t->buffer) || w.idx >= ml.mappings.size() || !ml.mappings[w.idx]) {
+                continue;
+            }
+            const uintptr_t pg = 4096;
+            const uintptr_t a  = (uintptr_t) ml.mappings[w.idx]->addr() + w.offs;
+            const uintptr_t a0 = (a + pg - 1) & ~(pg - 1);
+            const uintptr_t a1 = (a + ggml_nbytes(t)) & ~(pg - 1);
+            if (a1 > a0) {
+                madvise((void *) a0, a1 - a0, MADV_PAGEOUT);
+            }
+        }
+    }
+#endif
+
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
     }
 
+    load_moe_hot();
+
     return true;
+}
+
+void llama_model_base::load_moe_hot() {
+    const char * path = getenv("LLAMA_MOE_HOT");
+    if (path == nullptr || path[0] == '\0') {
+        return;
+    }
+
+    ggml_backend_dev_t dev = nullptr;
+    for (const auto & d : devices) {
+        if (!d.is_meta && ggml_backend_dev_type(d.dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            dev = d.dev;
+            break;
+        }
+    }
+    if (dev == nullptr) {
+        LLAMA_LOG_WARN("%s: no GPU device, LLAMA_MOE_HOT is ignored\n", __func__);
+        return;
+    }
+
+    std::ifstream fin(path);
+    if (!fin) {
+        throw std::runtime_error(format("LLAMA_MOE_HOT: cannot open %s", path));
+    }
+
+    // one line per layer: "<layer> <expert> <expert> ...", '#' starts a comment line
+    const int64_t n_expert = hparams.n_expert;
+    std::vector<std::vector<int32_t>> lists(layers.size());
+    std::string line;
+    while (std::getline(fin, line)) {
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        std::istringstream ss(line);
+        int64_t il = -1;
+        ss >> il;
+        if (il < 0 || il >= (int64_t) layers.size()) {
+            throw std::runtime_error(format("LLAMA_MOE_HOT: bad layer %" PRId64 " in %s", il, path));
+        }
+        int64_t e;
+        while (ss >> e) {
+            if (e < 0 || e >= n_expert) {
+                throw std::runtime_error(format("LLAMA_MOE_HOT: bad expert %" PRId64 " in layer %" PRId64, e, il));
+            }
+            lists[il].push_back((int32_t) e);
+        }
+    }
+
+    moe_hot.clear();
+    moe_hot.resize(layers.size());
+
+    ggml_init_params ip = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * 3 * layers.size(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(ip) };
+    ggml_context * ctx = ctx_ptr.get();
+
+    const char * part_name[3] = { "up", "gate", "down" };
+    int n_layers_hot = 0;
+    int n_experts_hot = 0;
+
+    for (size_t il = 0; il < layers.size(); ++il) {
+        auto & ids   = lists[il];
+        auto & layer = layers[il];
+        if (ids.empty() || layer.ffn_up_exps == nullptr) {
+            continue;
+        }
+
+        ggml_tensor * src[3] = { layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps };
+        bool ok = layer.ffn_gate_up_exps == nullptr &&
+                  !layer.ffn_up_exps_b && !layer.ffn_gate_exps_b && !layer.ffn_down_exps_b &&
+                  !layer.ffn_up_exps_s && !layer.ffn_gate_exps_s && !layer.ffn_down_exps_s;
+        for (ggml_tensor * t : src) {
+            ok = ok && t && t->buffer && t->data && ggml_backend_buffer_is_host(t->buffer) && ggml_is_contiguous(t);
+        }
+        if (!ok) {
+            LLAMA_LOG_WARN("%s: layer %zu: routed experts are not plain tensors in host memory, skipped\n", __func__, il);
+            continue;
+        }
+
+        std::sort(ids.begin(), ids.end());
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+        if ((int64_t) ids.size() >= n_expert) {
+            throw std::runtime_error(format("LLAMA_MOE_HOT: layer %zu must keep at least one cold expert", il));
+        }
+        if ((int64_t) ids.size() < (int64_t) hparams.n_expert_used) {
+            LLAMA_LOG_WARN("%s: layer %zu: fewer hot experts than experts per token, skipped\n", __func__, il);
+            continue;
+        }
+
+        auto & hot = moe_hot[il];
+        hot.slot.assign(n_expert, -1);
+        hot.score.assign(n_expert, 0.0f);
+        for (size_t k = 0; k < ids.size(); ++k) {
+            hot.slot[ids[k]] = (int32_t) k;
+        }
+        // 2 x n_expert_used fillers: enough for distinct fillers that avoid the real cold experts of a token
+        for (int32_t e = 0; e < n_expert && (int64_t) hot.cold_fill.size() < 2*(int64_t) hparams.n_expert_used; ++e) {
+            if (hot.slot[e] < 0) {
+                hot.cold_fill.push_back(e);
+            }
+        }
+        if ((int64_t) hot.cold_fill.size() < 2*(int64_t) hparams.n_expert_used) {
+            LLAMA_LOG_WARN("%s: layer %zu: too few cold experts for fillers, skipped\n", __func__, il);
+            hot.slot.clear();
+            hot.cold_fill.clear();
+            continue;
+        }
+
+        ggml_tensor ** dst[3] = { &hot.up, &hot.gate, &hot.down };
+        for (int k = 0; k < 3; ++k) {
+            *dst[k] = ggml_new_tensor_3d(ctx, src[k]->type, src[k]->ne[0], src[k]->ne[1], (int64_t) ids.size());
+            ggml_format_name(*dst[k], "blk.%zu.ffn_%s_exps.hot", il, part_name[k]);
+        }
+
+        n_layers_hot++;
+        n_experts_hot += (int) ids.size();
+    }
+
+    if (n_layers_hot == 0) {
+        LLAMA_LOG_WARN("%s: LLAMA_MOE_HOT gave no usable layers\n", __func__);
+        moe_hot.clear();
+        return;
+    }
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_dev_buffer_type(dev));
+    if (buf == nullptr) {
+        throw std::runtime_error("LLAMA_MOE_HOT: cannot allocate the hot expert buffer");
+    }
+    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    const int64_t t_start = ggml_time_us();
+    for (size_t il = 0; il < layers.size(); ++il) {
+        auto & hot = moe_hot[il];
+        if (hot.up == nullptr) {
+            continue;
+        }
+        auto & layer = layers[il];
+        ggml_tensor * src[3] = { layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps };
+        ggml_tensor * dst[3] = { hot.up, hot.gate, hot.down };
+        for (int k = 0; k < 3; ++k) {
+            GGML_ASSERT(src[k]->nb[2] == dst[k]->nb[2]);
+            const size_t n = src[k]->nb[2];
+            for (int32_t e = 0; e < n_expert; ++e) {
+                const int32_t s = hot.slot[e];
+                if (s >= 0) {
+                    ggml_backend_tensor_set(dst[k], (const char *) src[k]->data + e*n, s*n, n);
+#ifdef MADV_PAGEOUT
+                    // the CPU never reads a hot expert: drop its pages from the page cache (the edge pages are shared with neighbors)
+                    const uintptr_t pg = 4096;
+                    const uintptr_t a  = (uintptr_t) src[k]->data + (size_t) e*n;
+                    const uintptr_t a0 = (a + pg - 1) & ~(pg - 1);
+                    const uintptr_t a1 = (a + n) & ~(pg - 1);
+                    if (a1 > a0) {
+                        madvise((void *) a0, a1 - a0, MADV_PAGEOUT);
+                    }
+#endif
+                }
+            }
+        }
+        layer.moe_hot = &hot;
+    }
+
+#ifndef _WIN32
+    // LLAMA_MOE_HOT_MLOCK=1: lock the cold experts in RAM, so that other programs cannot push them out of the page cache
+    const char * lock_env = getenv("LLAMA_MOE_HOT_MLOCK");
+    if (lock_env && atoi(lock_env) != 0) {
+        const int64_t   t_lock = ggml_time_us();
+        const uintptr_t pg     = 4096;
+        size_t n_locked = 0;
+        bool   ok       = true;
+        for (size_t il = 0; il < layers.size() && ok; ++il) {
+            const auto & hot = moe_hot[il];
+            if (hot.up == nullptr) {
+                continue;
+            }
+            const auto & layer = layers[il];
+            const ggml_tensor * src[3] = { layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps };
+            for (int k = 0; k < 3 && ok; ++k) {
+                const size_t n = src[k]->nb[2];
+                // one mlock per run of consecutive cold experts
+                for (int64_t e = 0; e < n_expert; ) {
+                    if (hot.slot[e] >= 0) {
+                        ++e;
+                        continue;
+                    }
+                    int64_t e1 = e;
+                    while (e1 < n_expert && hot.slot[e1] < 0) {
+                        ++e1;
+                    }
+                    const uintptr_t a0 = ((uintptr_t) src[k]->data + (size_t) e*n) & ~(pg - 1);
+                    const uintptr_t a1 = ((uintptr_t) src[k]->data + (size_t) e1*n + pg - 1) & ~(pg - 1);
+                    if (mlock((void *) a0, a1 - a0) != 0) {
+                        LLAMA_LOG_WARN("%s: mlock of the cold experts stopped after %.2f GiB (%s), raise the memlock limit (ulimit -l)\n",
+                                __func__, n_locked / 1073741824.0, strerror(errno));
+                        ok = false;
+                        break;
+                    }
+                    n_locked += a1 - a0;
+                    e = e1;
+                }
+            }
+        }
+        moe_hot_locked = n_locked > 0;
+        LLAMA_LOG_INFO("%s: locked %.2f GiB of cold experts in RAM in %.1f s\n", __func__, n_locked / 1073741824.0, (ggml_time_us() - t_lock) / 1e6);
+    }
+#endif
+
+    LLAMA_LOG_INFO("%s: %d hot experts in %d layers, %.2f MiB on %s, copied in %.1f s\n", __func__,
+            n_experts_hot, n_layers_hot, ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0,
+            ggml_backend_dev_name(dev), (ggml_time_us() - t_start) / 1e6);
+
+    std::vector<ggml_backend_buffer_ptr> bufs;
+    bufs.emplace_back(buf);
+    pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
+}
+
+bool llama_model::moe_hot_adapt_due(int64_t n_tokens) const {
+    static const int64_t period = [] {
+        const char * s = getenv("LLAMA_MOE_HOT_ADAPT");
+        return s ? (int64_t) atoll(s) : (int64_t) 0;
+    }();
+    if (period <= 0 || moe_hot.empty()) {
+        return false;
+    }
+    moe_hot_tokens += n_tokens;
+    return moe_hot_tokens >= period;
+}
+
+void llama_model::moe_hot_adapt() const {
+    // knobs: max swaps per step, decay of the use counts per step, how much more a cold expert must be used
+    static const int max_swaps = [] {
+        const char * s = getenv("LLAMA_MOE_HOT_SWAPS");
+        return s ? atoi(s) : 64;
+    }();
+    static const float decay = [] {
+        const char * s = getenv("LLAMA_MOE_HOT_DECAY");
+        return s ? (float) atof(s) : 0.8f;
+    }();
+    static const float hyst = [] {
+        const char * s = getenv("LLAMA_MOE_HOT_HYST");
+        return s ? (float) atof(s) : 2.0f;
+    }();
+    const int64_t t_start = ggml_time_us();
+    moe_hot_tokens = 0;
+
+    struct swap_cand {
+        float   gain;
+        size_t  il;
+        int32_t cold; // expert to bring in
+        int32_t hot;  // expert to move out
+    };
+    std::vector<swap_cand> cands;
+
+    // per layer: pair the most used cold experts with the least used hot ones
+    const int k_max = 8;
+    for (size_t il = 0; il < moe_hot.size(); ++il) {
+        const auto & hot = moe_hot[il];
+        if (hot.up == nullptr) {
+            continue;
+        }
+        std::vector<int32_t> cold_ids;
+        std::vector<int32_t> hot_ids;
+        for (int32_t e = 0; e < (int32_t) hot.slot.size(); ++e) {
+            (hot.slot[e] < 0 ? cold_ids : hot_ids).push_back(e);
+        }
+        const int k = std::min<int>(k_max, (int) std::min(cold_ids.size(), hot_ids.size()));
+        std::partial_sort(cold_ids.begin(), cold_ids.begin() + k, cold_ids.end(),
+                [&](int32_t a, int32_t b) { return hot.score[a] > hot.score[b]; });
+        std::partial_sort(hot_ids.begin(), hot_ids.begin() + k, hot_ids.end(),
+                [&](int32_t a, int32_t b) { return hot.score[a] < hot.score[b]; });
+        for (int i = 0; i < k; ++i) {
+            const float sc = hot.score[cold_ids[i]];
+            const float sh = hot.score[hot_ids[i]];
+            // hysteresis, so that experts do not bounce between the parts
+            if (sc >= 4.0f && sc > hyst*sh + 2.0f) {
+                cands.push_back({ sc - sh, il, cold_ids[i], hot_ids[i] });
+            }
+        }
+    }
+
+    std::sort(cands.begin(), cands.end(), [](const swap_cand & a, const swap_cand & b) { return a.gain > b.gain; });
+    if ((int) cands.size() > max_swaps) {
+        cands.resize(max_swaps);
+    }
+
+    std::vector<std::pair<uintptr_t, size_t>> to_lock; // evicted experts, locked in the background (LLAMA_MOE_HOT_MLOCK)
+    for (const auto & c : cands) {
+        auto & hot = moe_hot[c.il];
+        const auto & layer = layers[c.il];
+        const int32_t s = hot.slot[c.hot];
+        ggml_tensor * src[3] = { layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps };
+        ggml_tensor * dst[3] = { hot.up, hot.gate, hot.down };
+        for (int k = 0; k < 3; ++k) {
+            const size_t n = src[k]->nb[2];
+            ggml_backend_tensor_set(dst[k], (const char *) src[k]->data + c.cold*n, s*n, n);
+        }
+        hot.slot[c.cold] = s;
+        hot.slot[c.hot]  = -1;
+#ifndef _WIN32
+        // the evicted expert is served by the CPU from now on: start reading its pages in the background
+        for (int k = 0; k < 3; ++k) {
+            const size_t n  = src[k]->nb[2];
+            const size_t pg = 4096;
+            uintptr_t a = (uintptr_t) src[k]->data + (size_t) c.hot*n;
+            const uintptr_t a0 = a & ~(uintptr_t) (pg - 1);
+            madvise((void *) a0, n + (a - a0), MADV_WILLNEED);
+            if (moe_hot_locked) {
+                to_lock.emplace_back(a0, ((a + n + pg - 1) & ~(uintptr_t) (pg - 1)) - a0);
+            }
+            // the new hot expert is served from VRAM: unlock it and let its pages leave the page cache first (the edge pages are shared with neighbors)
+            a = (uintptr_t) src[k]->data + (size_t) c.cold*n;
+            const uintptr_t b0 = (a + pg - 1) & ~(uintptr_t) (pg - 1);
+            const uintptr_t b1 = (a + n) & ~(uintptr_t) (pg - 1);
+            if (b1 > b0) {
+                if (moe_hot_locked) {
+                    munlock((void *) b0, b1 - b0);
+                }
+#ifdef MADV_COLD
+                madvise((void *) b0, b1 - b0, MADV_COLD);
+#endif
+            }
+        }
+#endif
+        for (auto & f : hot.cold_fill) {
+            if (f == c.cold) {
+                f = c.hot;
+            }
+        }
+    }
+
+#ifndef _WIN32
+    if (!to_lock.empty()) {
+        // mlock reads the pages from disk if needed, so keep it off the decode thread
+        std::thread([ranges = std::move(to_lock)] {
+            for (const auto & r : ranges) {
+                mlock((void *) r.first, r.second);
+            }
+        }).detach();
+    }
+#endif
+
+    for (auto & hot : moe_hot) {
+        for (auto & x : hot.score) {
+            x *= decay;
+        }
+    }
+
+    if (cands.size() >= 8) {
+        LLAMA_LOG_INFO("%s: %zu expert swaps in %.1f ms\n", __func__, cands.size(), (ggml_time_us() - t_start) / 1e3);
+    }
 }
 
 #ifndef _WIN32
