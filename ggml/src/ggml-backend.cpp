@@ -1619,6 +1619,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         // copy the input tensors to the split backend
+        // without events, one sync of the split backend is enough: a second sync would only flush the async copies queued below
+        // reads from a device into host memory are queued too, with one sync per input backend after the loop
+        static const bool legacy_copy = getenv("GGML_SCHED_LEGACY_COPY") != nullptr;
+        bool split_backend_idle = false;
+        ggml_backend_t get_backends[GGML_SCHED_MAX_BACKENDS];
+        int n_get_backends = 0;
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
@@ -1636,8 +1642,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
-                } else {
+                } else if (!split_backend_idle) {
                     ggml_backend_synchronize(split_backend);
+                    split_backend_idle = !legacy_copy;
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
@@ -1729,16 +1736,32 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
-                        ggml_backend_synchronize(input_backend);
-                        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                        if (!legacy_copy && sched->events[split_backend_id][sched->cur_copy] == NULL &&
+                            input_backend->iface.get_tensor_async != NULL && ggml_backend_buffer_is_host(input_cpy->buffer) &&
+                            input->buffer->buft == ggml_backend_get_default_buffer_type(input_backend)) {
+                            ggml_backend_tensor_get_async(input_backend, input, input_cpy->data, 0, ggml_nbytes(input));
+                            bool found = false;
+                            for (int i = 0; i < n_get_backends; i++) {
+                                found = found || get_backends[i] == input_backend;
+                            }
+                            if (!found) {
+                                get_backends[n_get_backends++] = input_backend;
+                            }
                         } else {
-                            ggml_backend_synchronize(split_backend);
+                            ggml_backend_synchronize(input_backend);
+                            if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                                ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                            } else {
+                                ggml_backend_synchronize(split_backend);
+                            }
+                            ggml_backend_tensor_copy(input, input_cpy);
                         }
-                        ggml_backend_tensor_copy(input, input_cpy);
                     }
                 }
             }
+        }
+        for (int i = 0; i < n_get_backends; i++) {
+            ggml_backend_synchronize(get_backends[i]);
         }
 
         if (!sched->callback_eval) {
