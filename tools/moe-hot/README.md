@@ -72,10 +72,13 @@ Hot experts alone help little without speculative decoding: most of the gain com
 - **CPU cost.** IQ2_S experts on the CPU are compute bound, not memory bound. More threads than cores (SMT) made it much slower, 6 threads instead of 8 slower too.
 - **Measuring.** A cold page cache makes the first pass after a load useless, so compare second passes and check major faults in `/proc/PID/stat`. A full zram swap made the kernel evict the experts, and prefill fell from 234 to 57 t/s.
 - **MTP draft length.** A different draft length changes the text (the batched verification is numerically different), so compare means over several prompts. Here 3 draft tokens was best; longer drafts and a `p_min` cutoff did not help.
+- **Trimmed-vocabulary MTP heads (`frspec-65k`).** They can only draft the 65k most frequent tokens. The Q8_0-frspec-65k head instead of the full-vocabulary Q4_K_M (same hot list) cut Russian acceptance from 60% to 25%, and decode from 29.6 to 18.4 t/s. English prose acceptance fell from 69% to 62% (-10% speed); code was unchanged. For languages other than English, keep a full-vocabulary head.
 
 ## Limitations
 
-- Only `qwen4exp` is wired. For another arch, pass `layer.moe_hot` to `build_moe_ffn`. Fused `gate_up`, expert biases (gpt-oss) and expert scales are not supported.
+- Only `qwen4exp` is wired. The hot/cold split lives in the generic `build_moe_ffn`, so another arch needs one change: pass `layer.moe_hot` to its `build_moe_ffn` call. Other archs are untested.
+- The GGUF must keep gate/up/down experts as separate tensors, without expert biases or per-expert scales. Layers that do not are skipped with a warning; gpt-oss, for example, has expert biases.
+- The scheduler and Vulkan changes are not tied to a model: they apply to any MoE run with the experts on the CPU.
 - Configuration is by env vars. The page cache and mlock parts are Linux only. Only RDNA3 with RADV was tested.
 
 ## Credits
