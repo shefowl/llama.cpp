@@ -1,3 +1,6 @@
+> [!NOTE]
+> **Fork:** the `vulkan-moe-hot` branch keeps copies of the often used MoE experts in VRAM when the routed experts run on the CPU (Vulkan), plus MTP for `qwen4exp`. See [tools/moe-hot/README.md](tools/moe-hot/README.md).
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
