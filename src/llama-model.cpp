@@ -28,7 +28,14 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <cinttypes>
 #include <cstdint>
+#include <thread>
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -1683,7 +1690,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const size_t n_max_backend_buffer = ml.ctx_map.size() * ml.files.size();
     pimpl->ctxs_bufs.reserve(n_max_backend_buffer);
 
-    for (auto & [buft, ctx_ptr] : ml.ctx_map) {
+    for (auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
+        ggml_backend_buffer_type_t buft = ctx_key.buft;
         ggml_context * ctx = ctx_ptr.get();
 
         // skip contexts without tensors
@@ -1709,7 +1717,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
 
         std::vector<ggml_backend_buffer_ptr> bufs;
-        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+
+        // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
+        const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
+
+        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
@@ -1809,6 +1821,65 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     return true;
 }
+
+#ifndef _WIN32
+const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader & ml, const char * tensor_name, const ggml_tensor * t) {
+    if (ml.lazy.mode != LLAMA_LAZY_MODE_DIRECT) {
+        return nullptr;
+    }
+
+    if (!t) {
+        return nullptr;
+    }
+
+    if (const auto it = lazy_readers.find(tensor_name); it != lazy_readers.end()) {
+        return it->second.get();
+    }
+
+    const auto * w = ml.get_weight(tensor_name);
+    if (!w) {
+        // e.g. synthesised from metadata, no file rows to read
+        return nullptr;
+    }
+
+    // an independently opened buffered descriptor: dup() would share the
+    // loader's open file description, whose readahead advice and O_DIRECT
+    // flag would fight the small scattered row reads
+    const int fd = ::open(ml.files[w->idx]->name().c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        // e.g. a FILE*-backed model has no reopenable path; the tensor is
+        // still lazy, so keep serving it through the mmap reads
+        LLAMA_LOG_WARN("%s: could not open %s for direct reads (%s), using lazy mmap reads\n",
+                __func__, ml.files[w->idx]->name().c_str(), strerror(errno));
+        return nullptr;
+    }
+
+#ifdef __linux__
+    // rows are tiny and scattered, so sequential readahead would be pure waste
+    ::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+#endif
+
+    // in-flight reads are IO queue depth, not compute; 2x cores worked well
+    // on NVMe and stays sane on smaller machines
+    const int n_threads = 2 * (int) std::max(1u, std::thread::hardware_concurrency());
+
+    auto reader = std::make_unique<llama_lazy_reader>(fd, w->offs,
+            ggml_row_size(t->type, t->ne[0]), t->ne[1], n_threads, t->type, t->ne[0]);
+
+    LLAMA_LOG_INFO("%s: direct reads enabled for %s: %" PRId64 " rows of %zu bytes at file offset %zu, %d threads\n",
+            __func__, tensor_name, reader->n_rows, reader->row_size, w->offs, n_threads);
+
+    lazy_readers[tensor_name] = std::move(reader);
+    return lazy_readers.at(tensor_name).get();
+}
+#else
+const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader & ml, const char *, const ggml_tensor *) {
+    if (ml.lazy.mode == LLAMA_LAZY_MODE_DIRECT) {
+        LLAMA_LOG_WARN("%s: --lazy-mode on-direct is not supported on this platform, using lazy mmap reads\n", __func__);
+    }
+    return nullptr;
+}
+#endif
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
@@ -2675,6 +2746,7 @@ llama_model_params llama_model_default_params() {
         /*.n_gpu_layers                =*/ -1,
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
+        /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
@@ -3112,7 +3184,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
     TENSOR_NOT_REQUIRED   (llama_model_loader::TENSOR_NOT_REQUIRED),
     TENSOR_SKIP           (llama_model_loader::TENSOR_SKIP),
     TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
-    TENSOR_ALLOW_RESHAPE  (llama_model_loader::TENSOR_ALLOW_RESHAPE) {}
+    TENSOR_ALLOW_RESHAPE  (llama_model_loader::TENSOR_ALLOW_RESHAPE),
+    TENSOR_READ_LAZY      (llama_model_loader::TENSOR_READ_LAZY) {}
 
 ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     GGML_ASSERT(ml != nullptr);
