@@ -2173,6 +2173,8 @@ private:
 std::mutex vk_memory_logger::log_mutex;
 
 static bool vk_perf_logger_enabled = false;
+// graphs with less work are submitted once, at the end (no flops chunks, no almost_ready fence)
+static uint64_t vk_small_graph_flops = 0;
 static bool vk_perf_logger_concurrent = false;
 static bool vk_enable_sync_logger = false;
 // number of calls between perf logger prints
@@ -7500,6 +7502,8 @@ static void ggml_vk_instance_init() {
     }
 
     vk_perf_logger_enabled = getenv("GGML_VK_PERF_LOGGER") != nullptr;
+    const char * small_graph_gflops = getenv("GGML_VK_SMALL_GRAPH_GFLOPS");
+    vk_small_graph_flops = small_graph_gflops ? (uint64_t) (atof(small_graph_gflops) * 1e9) : 0;
     vk_perf_logger_concurrent = getenv("GGML_VK_PERF_LOGGER_CONCURRENT") != nullptr;
     vk_enable_sync_logger = getenv("GGML_VK_SYNC_LOGGER") != nullptr;
     vk_memory_logger_enabled = getenv("GGML_VK_MEMORY_LOGGER") != nullptr;
@@ -17636,6 +17640,17 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
     }
     uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
+    bool small_graph = false;
+    if (vk_small_graph_flops > 0) {
+        uint64_t graph_flops = 0;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            graph_flops += ggml_vk_get_node_flops(cgraph->nodes[i]);
+        }
+        small_graph = graph_flops < vk_small_graph_flops;
+    }
+    if (small_graph) {
+        flops_per_submit = 0;
+    }
 
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {
@@ -17934,7 +17949,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
 
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
-        bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
+        bool almost_ready = !small_graph && (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
         bool submit = (submitted_nodes >= ctx->device->max_nodes_per_submit) ||
                       (flops_per_submit != 0 && batch_flops >= flops_per_submit) ||
                       (i + ctx->num_additional_fused_ops >= last_node) ||
