@@ -14006,8 +14006,10 @@ static void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, cons
     // workgroup per row, indices in no particular order (the ggml_top_k contract).
     // The shader indexes with 32-bit arithmetic; supports_op enforces the same bound.
     GGML_ASSERT((uint64_t) nrows * ncols <= UINT32_MAX && (uint64_t) nrows * k <= UINT32_MAX);
-    if (k > (1u << (num_topk_pipelines - 1)) ||
-        ctx->device->pipeline_topk_f32[(uint32_t)log2f(float(k)) + 1] == nullptr) {
+    // same test as supports_op: k = 1024 needs pipeline 11, one past the end of pipeline_topk_f32
+    const uint32_t min_pipeline_k = (uint32_t)log2f(float(k)) + 1;
+    if (min_pipeline_k >= num_topk_pipelines ||
+        ctx->device->pipeline_topk_f32[min_pipeline_k] == nullptr) {
         vk_pipeline pipeline = ctx->device->pipeline_topk_radix_f32;
         GGML_ASSERT(pipeline != nullptr);
 
