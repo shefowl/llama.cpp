@@ -33,17 +33,18 @@ The [GSQ-RCO quants by IST-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Fl
 
 The merged file: [shefowl/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-Hybrid-GGUF](https://huggingface.co/shefowl/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-Hybrid-GGUF), built from [SC117's abliterated GSQ-RCO GGUFs](https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF).
 
-Decode t/s, a different bench from the table above (1 prompt per domain, 400 tokens, second pass), GPU `high`, cold experts locked, MTP with 3 draft tokens, about 1.9 GB of VRAM left; mean of 2 runs for the first two rows, runs within 4%:
+Decode t/s, a different bench from the table above (1 prompt per language or topic, 400 tokens, second pass), GPU `high`, cold experts locked, MTP with 3 draft tokens, about 1.9 GB of VRAM left, all rows in one session. Run to run the numbers move by about 5%, between sessions by up to 10% (the desktop's VRAM use changes the hot list):
 
-| | hot experts | code | science | English prose | Russian | locked in RAM |
-|---|---|---|---|---|---|---|
-| hybrid | 13.0 GB, 72.7% of calls | **59.4** | **43.3** | **29.9** | **30.0** | 22.1 GiB |
-| GSQ-RCO IQ3_XXS | 12.05 GB, 70.2% | 49.2 | 34.9 | 22.5 | 23.1 | 28.8 GiB |
-| AD-4.27 | 11.5 GB, 63.3% | 41.9 | 28.0 | 17.9 | 21.3 | 36.5 GiB |
+| | hot experts | code | science | English prose | Cyrillic (Russian) | Chinese | locked in RAM |
+|---|---|---|---|---|---|---|---|
+| hybrid | 12.6 GB, 71.6% of calls | **54.5** | **40.1** | **25.5** | **27.2** | **23.1** | 22.4 GiB |
+| GSQ-RCO IQ3_XXS | 12.0 GB, 69.9% | 48.6 | 34.4 | 19.6 | 23.3 | 18.4 | 28.9 GiB |
+| GSQ-RCO Q2_0 tier | 12.9 GB, 80.1% | 65.8 | 47.5 | 29.8 | 30.5 | 27.0 | 19.7 GiB |
+| AD-4.27 | 11.5 GB, 63.4% | 43.8 | 28.6 | 17.7 | 20.2 | 17.1 | 36.5 GiB |
 
-At equal free VRAM the hybrid holds 0.9 GB more hot experts than IQ3_XXS: the prefill compute buffer holds the cold tensors of one layer, and Q2_0 ones are smaller.
+The Q2_0 tier is the fastest, but at +4.3% perplexity against IQ3_XXS (below). At equal free VRAM the hybrid holds 0.6-0.9 GB more hot experts than IQ3_XXS: the prefill compute buffer holds the cold tensors of one layer, and Q2_0 ones are smaller.
 
-Quality against IQ3_XXS (the only difference is the cold experts): perplexity ratio 0.998 ± 0.008 on 20k tokens of mixed English, C++ and Russian text; GSM-Plus 78/100 on both, with the same answer on every task; CRUXEval-O 94 vs 97 out of 100 (five character-level slips by the hybrid, not significant at this size). The mean KLD is 0.22 with the same top-1 token in 84% of positions, so the cold Q2_0 experts do move the distribution; with the hot/cold split alone (both IQ3_XXS) the KLD is 0.000.
+Quality against IQ3_XXS (the only difference is the cold experts): perplexity ratio 0.998 ± 0.008 (the Q2_0 tier 1.043 ± 0.011) on 20k tokens of mixed English, C++ and Russian text; GSM-Plus 78/100 on both, with the same answer on every task; CRUXEval-O 94 vs 97 out of 100 (five character-level slips by the hybrid, not significant at this size). The mean KLD is 0.22 with the same top-1 token in 84% of positions, so the cold Q2_0 experts do move the distribution; with the hot/cold split alone (both IQ3_XXS) the KLD is 0.000.
 
 ## What changed
 
