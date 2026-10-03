@@ -24,6 +24,27 @@ For reference, measured the day before (one prompt per domain, GPU `auto`, not r
 
 Hot experts alone help little without speculative decoding: most of the gain comes from the combination. When most experts of a layer are in VRAM, verifying 4 draft tokens costs little more than decoding 1.
 
+### GSQ-RCO hybrid: per-expert precision (2026-10-03)
+
+The [GSQ-RCO quants by IST-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) of the same model have smaller experts: 1.75 MB per expert in IQ3_XXS and 1.44 MB in the Q2_0 tier, against 2.06 MB in AD-4.27, so more of them fit in VRAM. The Q2_0 tier also cheapens the dense part (shared experts down to Q2_0, attention to Q3_K), and that is where most of its quality loss is. The hybrid takes the dense weights and the hot experts from IQ3_XXS and the cold experts from Q2_0:
+
+- `gguf_swap_experts.py` writes one GGUF with the IQ3_XXS trunk and the Q2_0 experts (tensors copied, nothing re-quantized);
+- `LLAMA_MOE_HOT_SRC=<IQ3_XXS shard 1>` makes the hot copies come from IQ3_XXS.
+
+The merged file: [shefowl/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-Hybrid-GGUF](https://huggingface.co/shefowl/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-Hybrid-GGUF), built from [SC117's abliterated GSQ-RCO GGUFs](https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF).
+
+Decode t/s, a different bench from the table above (1 prompt per domain, 400 tokens, second pass), GPU `high`, cold experts locked, MTP with 3 draft tokens, about 1.9 GB of VRAM left; mean of 2 runs for the first two rows, runs within 4%:
+
+| | hot experts | code | science | English prose | Russian | locked in RAM |
+|---|---|---|---|---|---|---|
+| hybrid | 13.0 GB, 72.7% of calls | **59.4** | **43.3** | **29.9** | **30.0** | 22.1 GiB |
+| GSQ-RCO IQ3_XXS | 12.05 GB, 70.2% | 49.2 | 34.9 | 22.5 | 23.1 | 28.8 GiB |
+| AD-4.27 | 11.5 GB, 63.3% | 41.9 | 28.0 | 17.9 | 21.3 | 36.5 GiB |
+
+At equal free VRAM the hybrid holds 0.9 GB more hot experts than IQ3_XXS: the prefill compute buffer holds the cold tensors of one layer, and Q2_0 ones are smaller.
+
+Quality against IQ3_XXS (the only difference is the cold experts): perplexity ratio 0.998 ± 0.008 on 20k tokens of mixed English, C++ and Russian text; GSM-Plus 78/100 on both, with the same answer on every task; CRUXEval-O 94 vs 97 out of 100 (five character-level slips by the hybrid, not significant at this size). The mean KLD is 0.22 with the same top-1 token in 84% of positions, so the cold Q2_0 experts do move the distribution; with the hot/cold split alone (both IQ3_XXS) the KLD is 0.000.
+
 ## What changed
 
 - **`LLAMA_MOE_HOT=<list>`** (`src/llama-model.cpp`, `src/llama-graph.cpp`). The list names the hot experts per layer. At load they are copied into VRAM. `build_moe_ffn` splits each MoE layer into a hot part (GPU, the copies) and a cold part (CPU, the mmap), with four small CPU ops that remap the router ids and weights. Hot fillers are distinct unused slots. Cold ids are `-1` for small batches (the CPU writes a zero row). For batches of 32+ tokens the scheduler may run the cold part on the GPU; there cold ids are distinct zero-weight fillers.
@@ -33,6 +54,9 @@ Hot experts alone help little without speculative decoding: most of the gain com
 - **Page cache.** After the load, the pages of the weights that went to the GPU and of the hot copies are dropped (`MADV_PAGEOUT`). `warm_experts.py` reads the cold experts without readahead: readahead, and btrfs compressed extents, pulled ~7 GB of hot experts back in.
 - **`LLAMA_MOE_HOT_MLOCK=1`** locks the cold experts (35.6 GiB here) in RAM, so other programs cannot evict them. Adaptation unlocks swapped-in experts and locks evicted ones in a background thread.
 - **`ggml-cpu`**: `mul_mat_id` gives a zero row for a negative expert id.
+- **`LLAMA_MOE_HOT_SRC=<file>`**: the hot copies are read from another single-file GGUF of the same model and keep its types, so hot and cold experts can have different precision. Adaptation copies from the same file.
+- **`ggml-cpu`, Q2_0 on x86**: upstream maps the Q2_0 dot product to the scalar code on x86, 48 cycles per 32 weights on Zen 4, which made Q2_0 experts on the CPU slower than IQ3_XXS ones. Now AVX2 (5.0 cycles) and AVX-512 VBMI (3.4 cycles: `vpmultishiftqb` unpacks 32 two-bit weights at once).
+- **`qwen4exp`**: the transposed mat-vec for the `hc_*_inject` weights only for F32/F16; BF16 weights (GSQ-RCO) hit a Vulkan assert.
 - **`qwen4exp`**, ported from other branches (see Credits): the MTP head can come from a sidecar GGUF (`--spec-type draft-mtp -md <file>`), and `--lazy-mode` reads the big n-gram embedding table on demand.
 
 ## Usage
@@ -43,6 +67,7 @@ Hot experts alone help little without speculative decoding: most of the gain com
    ```bash
    python3 tools/moe-hot/moe_hot_list.py hot.txt 12.5 imatrix-code.gguf imatrix-prose.gguf --model 'model-*-of-*.gguf'
    ```
+   Expert sizes come from `--model`: with `LLAMA_MOE_HOT_SRC`, give the file the hot copies are read from. The scripts need this repo's `gguf-py` for newer types such as Q2_0 (`PYTHONPATH=gguf-py`).
 4. Run:
    ```bash
    MODEL=model-00001-of-00033.gguf HOT_LIST=hot.txt MTP=mtp-head.gguf tools/moe-hot/run-hot.sh
@@ -58,6 +83,7 @@ Hot experts alone help little without speculative decoding: most of the gain com
 | env var | default | |
 |---|---|---|
 | `LLAMA_MOE_HOT` | unset | hot expert list |
+| `LLAMA_MOE_HOT_SRC` | unset | one GGUF file of another quant of the model; the hot copies are read from it |
 | `LLAMA_MOE_HOT_ADAPT` | 0 (off) | adaptation period in tokens (the script sets 256) |
 | `LLAMA_MOE_HOT_SWAPS` / `_DECAY` / `_HYST` | 64 / 0.8 / 2.0 | swaps per step, decay of use counts, how much more a cold expert must be used |
 | `LLAMA_MOE_HOT_MLOCK` | 0 | lock the cold experts in RAM |
@@ -86,4 +112,5 @@ Hot experts alone help little without speculative decoding: most of the gain com
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT) by ggml-org and contributors.
 - The first commit is ported, not written here: the qwen4exp NextN/MTP draft head by Ryan Monsurate; loading a detached MTP head GGUF by crusaderky (crusaderky/llama.cpp@a82a58a), as combined by drluoto in [drluoto/llama.cpp](https://github.com/drluoto/llama.cpp/tree/strix-halo-vulkan); lazy reads of the PLE table (`--lazy-mode`, `llama-lazy-reader.h`) by Josh Leverette, [ggml-org/llama.cpp#28136](https://github.com/ggml-org/llama.cpp/pull/28136).
 - The MTP head GGUF: [drluoto/Qwen3.8-Flash-Next-MTP-GGUF](https://huggingface.co/drluoto/Qwen3.8-Flash-Next-MTP-GGUF). The model: AtomicChat and Navin-Models, linked above.
+- The hybrid: GSQ + RCO and the quantized weights by IST-DASLab, the abliterated weights by orcarouter, the abliterated GGUFs by SC117; the base model by Qwen.
 - The other commits were developed with AI assistance (Claude); they carry an `Assisted-by` trailer.

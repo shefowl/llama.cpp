@@ -1,6 +1,7 @@
 #!/bin/bash
 # Example launcher: routed experts on the CPU, hot copies in VRAM (LLAMA_MOE_HOT), optional MTP.
 # usage: MODEL=<first .gguf shard> HOT_LIST=<list> [MTP=<mtp head .gguf>] [CTX=32768] [PORT=8080] [THREADS=8] \
+#        [LLAMA_MOE_HOT_SRC=<another quant of the model, one .gguf file>] \
 #        tools/moe-hot/run-hot.sh [extra llama-server args]
 # These are the settings the numbers in README.md were measured with.
 DIR=$(cd "$(dirname "$0")" && pwd)
@@ -37,6 +38,6 @@ until curl -sf "http://127.0.0.1:$PORT/health" >/dev/null; do
     kill -0 $PID 2>/dev/null || exit 1
     sleep 1
 done
-python3 "$DIR/warm_experts.py" "$GLOB" "$HOT_LIST" ${MTP:+"$MTP"}
+PYTHONPATH="$DIR/../../gguf-py${PYTHONPATH:+:$PYTHONPATH}" python3 "$DIR/warm_experts.py" "$GLOB" "$HOT_LIST" ${MTP:+"$MTP"}
 echo "locked in RAM: $(awk '/VmLck/ {printf "%.1f GiB", $2/1048576}' /proc/$PID/status)"
 wait $PID
