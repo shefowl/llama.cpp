@@ -33,7 +33,7 @@ The [GSQ-RCO quants by IST-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Fl
 
 The merged file: [shefowl/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-Hybrid-GGUF](https://huggingface.co/shefowl/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-Hybrid-GGUF), built from [SC117's abliterated GSQ-RCO GGUFs](https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF).
 
-Decode t/s, a different bench from the table above (1 prompt per language or topic, 400 tokens, second pass), GPU `high`, cold experts locked, MTP with 3 draft tokens, about 1.9 GB of VRAM left, all rows in one session. Run to run the numbers move by about 5%, between sessions by up to 10% (the desktop's VRAM use changes the hot list):
+Decode t/s, a different bench from the table above (1 prompt per language or topic, 400 tokens, second pass, adaptation off), GPU `high`, cold experts locked, MTP with 3 draft tokens, about 1.9 GB of VRAM left, all rows in one session. Run to run the numbers move by about 5%, between sessions by up to 10% (the desktop's VRAM use changes the hot list):
 
 | | hot experts | code | science | English prose | Cyrillic (Russian) | Chinese | locked in RAM |
 |---|---|---|---|---|---|---|---|
@@ -44,12 +44,21 @@ Decode t/s, a different bench from the table above (1 prompt per language or top
 
 The Q2_0 tier is the fastest, but at +4.3% perplexity against IQ3_XXS (below). At equal free VRAM the hybrid holds 0.6-0.9 GB more hot experts than IQ3_XXS: the prefill compute buffer holds the cold tensors of one layer, and Q2_0 ones are smaller.
 
+With adaptation on (`LLAMA_MOE_HOT_ADAPT=256`, as `run-hot.sh` sets it) the hybrid gets faster as an answer goes on. Five 2000-token answers one after another in one session (each one starts with the hot set of the previous topic), the 12.5 GB list from the HF repo, mean of two sessions per row (they agreed within 2%), t/s after the first 1000 tokens:
+
+| | code | science | English prose | Cyrillic (Russian) | Chinese |
+|---|---|---|---|---|---|
+| adaptation off | 53.2 | 39.6 | 29.1 | 29.7 | 25.0 |
+| adaptation on | **56.9** | **48.9** | **33.7** | **39.3** | **36.1** |
+
+Over the whole answer: +4% (code) to +40% (Chinese). MTP acceptance is the same with and without, so the gain comes from the hot hit rate. The first 500 tokens after each topic change were within 2% of the speed without adaptation, or faster.
+
 Quality against IQ3_XXS (the only difference is the cold experts): perplexity ratio 0.998 ± 0.008 (the Q2_0 tier 1.043 ± 0.011) on 20k tokens of mixed English, C++ and Russian text; GSM-Plus 78/100 on both, with the same answer on every task; CRUXEval-O 94 vs 97 out of 100 (five character-level slips by the hybrid, not significant at this size). The mean KLD is 0.22 with the same top-1 token in 84% of positions, so the cold Q2_0 experts do move the distribution; with the hot/cold split alone (both IQ3_XXS) the KLD is 0.000.
 
 ## What changed
 
 - **`LLAMA_MOE_HOT=<list>`** (`src/llama-model.cpp`, `src/llama-graph.cpp`). The list names the hot experts per layer. At load they are copied into VRAM. `build_moe_ffn` splits each MoE layer into a hot part (GPU, the copies) and a cold part (CPU, the mmap), with four small CPU ops that remap the router ids and weights. Hot fillers are distinct unused slots. Cold ids are `-1` for small batches (the CPU writes a zero row). For batches of 32+ tokens the scheduler may run the cold part on the GPU; there cold ids are distinct zero-weight fillers.
-- **`LLAMA_MOE_HOT_ADAPT=<tokens>`**: swaps experts between hot and cold at run time from decayed use counts. In a long one-topic session this gave +21%; when the topic changes every few prompts, about -5%.
+- **`LLAMA_MOE_HOT_ADAPT=<tokens>`**: swaps experts between hot and cold at run time from decayed use counts. With AD-4.27, in a long one-topic session this gave +21%; when the topic changes every few prompts, about -5%. With the GSQ-RCO hybrid, on 2000-token answers: +7% to +45% after the first 1000 tokens (above).
 - **Scheduler** (`ggml/src/ggml-backend.cpp`). Without events, the split backend is synchronized once per split: a sync before every input only flushed the async copies of the previous inputs. Device-to-host inputs are queued with `get_tensor_async` and waited for once. Before this, each layer had about 6 GPU waits, now 1.
 - **`GGML_VK_SMALL_GRAPH_GFLOPS=20`** (`ggml-vulkan.cpp`). A per-layer decode graph is submitted once, instead of about 6 flops-based chunks plus the `almost_ready` fence. Prefill graphs stay above the threshold.
 - **Page cache.** After the load, the pages of the weights that went to the GPU and of the hot copies are dropped (`MADV_PAGEOUT`). `warm_experts.py` reads the cold experts without readahead: readahead, and btrfs compressed extents, pulled ~7 GB of hot experts back in.
