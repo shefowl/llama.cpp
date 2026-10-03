@@ -698,6 +698,66 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 }
 
+void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK2_0;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_q2_0 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+#if defined(__AVX2__)
+    // weight w of a 32-weight half is bits 2w..2w+1 of its 8 bytes (4 weights per byte, low bits first)
+#if defined(__AVX512VBMI__) && defined(__AVX512VL__)
+    const __m256i shift_ctl = _mm256_setr_epi8(
+             0,  2,  4,  6,  8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30,
+            32, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62);
+    const __m256i m = _mm256_set1_epi8(3);
+#else
+    // repeat each byte 4 times, then pick field j for byte position j of every 4
+    const __m256i byte_shuf = _mm256_setr_epi8(
+            0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3,
+            4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7);
+    const __m256i m0 = _mm256_set1_epi32(0x00000003);
+    const __m256i m1 = _mm256_set1_epi32(0x00000300);
+    const __m256i m2 = _mm256_set1_epi32(0x00030000);
+    const __m256i m3 = _mm256_set1_epi32(0x03000000);
+#endif
+    const __m256i one = _mm256_set1_epi8(1);
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        for (int k = 0; k < 2; ++k) {
+            int64_t q8;
+            memcpy(&q8, x[ib].qs + 8*k, sizeof(q8));
+#if defined(__AVX512VBMI__) && defined(__AVX512VL__)
+            const __m256i q = _mm256_and_si256(_mm256_multishift_epi64_epi8(shift_ctl, _mm256_set1_epi64x(q8)), m);
+#else
+            const __m256i v = _mm256_shuffle_epi8(_mm256_set1_epi64x(q8), byte_shuf);
+            const __m256i q = _mm256_or_si256(
+                    _mm256_or_si256(_mm256_and_si256(v, m0), _mm256_and_si256(_mm256_srli_epi16(v, 2), m1)),
+                    _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(v, 4), m2), _mm256_and_si256(_mm256_srli_epi16(v, 6), m3)));
+#endif
+            const __m256i qx = _mm256_sub_epi8(q, one); // {0,1,2,3} -> {-1,0,1,2}
+            const __m256i qy = _mm256_loadu_si256((const __m256i *) y[ib*2 + k].qs);
+            const __m256 d = _mm256_set1_ps(d0 * GGML_CPU_FP16_TO_FP32(y[ib*2 + k].d));
+            acc = _mm256_fmadd_ps(d, mul_sum_i8_pairs_float(qx, qy), acc);
+        }
+    }
+
+    *s = hsum_float_8(acc);
+#else
+    ggml_vec_dot_q2_0_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
 void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;
     const int nb = n / qk;
