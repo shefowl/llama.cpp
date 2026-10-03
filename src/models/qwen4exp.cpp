@@ -658,7 +658,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         // shaders (4 columns <= the 8-column limit) and a tiny [nt,4] transpose restores
         // the layout.
         ggml_tensor * w;
-        if (!ggml_is_quantized(w_inject->type) && nt > 8) {
+        // only F32/F16 can be the src1 of a mat-vec (Vulkan asserts on BF16, e.g. GSQ-RCO quants)
+        if ((w_inject->type == GGML_TYPE_F32 || w_inject->type == GGML_TYPE_F16) && nt > 8) {
             w = ggml_mul_mat(ctx0, xn, w_inject);
             w = ggml_cont(ctx0, ggml_transpose(ctx0, w));
         } else {
