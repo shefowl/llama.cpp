@@ -265,6 +265,12 @@ struct llama_moe_hot {
     std::vector<int32_t> slot;      // expert id -> slot in the hot tensors, -1 if cold
     std::vector<int32_t> cold_fill; // cold experts used as zero-weight fillers when the cold part may run on the GPU
     std::vector<float>   score;     // decayed use count per expert (LLAMA_MOE_HOT_ADAPT)
+
+    // where hot copies are read from (up, gate, down): the model's own expert tensors, or the same tensors
+    // of another quant of the model (LLAMA_MOE_HOT_SRC), whose type may differ from the cold one
+    const char * src_data[3] = { nullptr, nullptr, nullptr }; // expert 0
+    size_t       src_nb2[3]  = { 0, 0, 0 };                   // bytes per expert
+    bool         src_other   = false;                         // true for LLAMA_MOE_HOT_SRC
 };
 
 struct llama_layer {

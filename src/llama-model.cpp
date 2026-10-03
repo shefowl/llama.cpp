@@ -1907,6 +1907,43 @@ void llama_model_base::load_moe_hot() {
     int n_layers_hot = 0;
     int n_experts_hot = 0;
 
+    // LLAMA_MOE_HOT_SRC: one GGUF file of another quant of the same model; the hot copies are read from its
+    // expert tensors and keep their type, e.g. precise hot experts on the GPU over fast low-bit cold ones on the CPU.
+    // opened at the first usable layer, so that a draft model without routed experts never touches it
+    const char * hot_src_path = getenv("LLAMA_MOE_HOT_SRC");
+    ggml_context * hot_src_meta = nullptr;
+    gguf_context_ptr hot_src_gguf;
+    ggml_context_ptr hot_src_meta_ptr;
+    std::unique_ptr<llama_mmap> hot_src_map;
+    size_t hot_src_bytes = 0;
+    auto hot_src_tensor = [&](const char * name, const ggml_tensor * like, const char ** data, size_t * nb2) -> ggml_type {
+        if (!hot_src_gguf) {
+            gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ &hot_src_meta };
+            hot_src_gguf.reset(gguf_init_from_file(hot_src_path, gp));
+            if (!hot_src_gguf) {
+                throw std::runtime_error(format("LLAMA_MOE_HOT_SRC: cannot read %s", hot_src_path));
+            }
+            hot_src_meta_ptr.reset(hot_src_meta);
+            llama_file f(hot_src_path, "rb");
+            hot_src_map = std::make_unique<llama_mmap>(&f, 0, false);
+        }
+        const ggml_tensor * t = ggml_get_tensor(hot_src_meta, name);
+        const int64_t tid = gguf_find_tensor(hot_src_gguf.get(), name);
+        if (t == nullptr || tid < 0) {
+            throw std::runtime_error(format("LLAMA_MOE_HOT_SRC: %s has no tensor %s (only one-file sources are supported)", hot_src_path, name));
+        }
+        if (!ggml_are_same_shape(t, like)) {
+            throw std::runtime_error(format("LLAMA_MOE_HOT_SRC: %s has another shape in %s", name, hot_src_path));
+        }
+        const size_t offs = gguf_get_data_offset(hot_src_gguf.get()) + gguf_get_tensor_offset(hot_src_gguf.get(), tid);
+        if (offs + ggml_nbytes(t) > hot_src_map->size()) {
+            throw std::runtime_error(format("LLAMA_MOE_HOT_SRC: %s runs past the end of %s", name, hot_src_path));
+        }
+        *data = (const char *) hot_src_map->addr() + offs;
+        *nb2  = t->nb[2];
+        return t->type;
+    };
+
     for (size_t il = 0; il < layers.size(); ++il) {
         auto & ids   = lists[il];
         auto & layer = layers[il];
@@ -1957,8 +1994,20 @@ void llama_model_base::load_moe_hot() {
 
         ggml_tensor ** dst[3] = { &hot.up, &hot.gate, &hot.down };
         for (int k = 0; k < 3; ++k) {
-            *dst[k] = ggml_new_tensor_3d(ctx, src[k]->type, src[k]->ne[0], src[k]->ne[1], (int64_t) ids.size());
+            ggml_type type = src[k]->type;
+            if (hot_src_path && hot_src_path[0]) {
+                char name[128];
+                snprintf(name, sizeof(name), "blk.%zu.ffn_%s_exps.weight", il, part_name[k]);
+                type = hot_src_tensor(name, src[k], &hot.src_data[k], &hot.src_nb2[k]);
+                hot.src_other = true;
+            } else {
+                hot.src_data[k] = (const char *) src[k]->data;
+                hot.src_nb2[k]  = src[k]->nb[2];
+            }
+            *dst[k] = ggml_new_tensor_3d(ctx, type, src[k]->ne[0], src[k]->ne[1], (int64_t) ids.size());
             ggml_format_name(*dst[k], "blk.%zu.ffn_%s_exps.hot", il, part_name[k]);
+            GGML_ASSERT((*dst[k])->nb[2] == hot.src_nb2[k]);
+            hot_src_bytes += hot.src_other ? hot.src_nb2[k] * ids.size() : 0;
         }
 
         n_layers_hot++;
@@ -1984,19 +2033,18 @@ void llama_model_base::load_moe_hot() {
             continue;
         }
         auto & layer = layers[il];
-        ggml_tensor * src[3] = { layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps };
         ggml_tensor * dst[3] = { hot.up, hot.gate, hot.down };
         for (int k = 0; k < 3; ++k) {
-            GGML_ASSERT(src[k]->nb[2] == dst[k]->nb[2]);
-            const size_t n = src[k]->nb[2];
+            const size_t n = hot.src_nb2[k];
             for (int32_t e = 0; e < n_expert; ++e) {
                 const int32_t s = hot.slot[e];
                 if (s >= 0) {
-                    ggml_backend_tensor_set(dst[k], (const char *) src[k]->data + e*n, s*n, n);
+                    ggml_backend_tensor_set(dst[k], hot.src_data[k] + e*n, s*n, n);
 #ifdef MADV_PAGEOUT
-                    // the CPU never reads a hot expert: drop its pages from the page cache (the edge pages are shared with neighbors)
+                    // the CPU never reads a hot expert, and LLAMA_MOE_HOT_SRC pages are read once:
+                    // drop the pages from the page cache (the edge pages are shared with neighbors)
                     const uintptr_t pg = 4096;
-                    const uintptr_t a  = (uintptr_t) src[k]->data + (size_t) e*n;
+                    const uintptr_t a  = (uintptr_t) hot.src_data[k] + (size_t) e*n;
                     const uintptr_t a0 = (a + pg - 1) & ~(pg - 1);
                     const uintptr_t a1 = (a + n) & ~(pg - 1);
                     if (a1 > a0) {
@@ -2007,6 +2055,13 @@ void llama_model_base::load_moe_hot() {
             }
         }
         layer.moe_hot = &hot;
+    }
+
+    if (hot_src_map) {
+        LLAMA_LOG_WARN("%s: hot experts read from LLAMA_MOE_HOT_SRC %s (%.2f MiB), cold experts keep the model's types\n",
+                __func__, hot_src_path, hot_src_bytes / 1024.0 / 1024.0);
+        // kept for LLAMA_MOE_HOT_ADAPT, which copies newly hot experts from the same source
+        pimpl->mappings.emplace_back(std::move(hot_src_map));
     }
 
 #ifndef _WIN32
@@ -2140,8 +2195,20 @@ void llama_model::moe_hot_adapt() const {
         ggml_tensor * src[3] = { layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps };
         ggml_tensor * dst[3] = { hot.up, hot.gate, hot.down };
         for (int k = 0; k < 3; ++k) {
-            const size_t n = src[k]->nb[2];
-            ggml_backend_tensor_set(dst[k], (const char *) src[k]->data + c.cold*n, s*n, n);
+            // from the hot source, which may be another quant than the cold tensor (LLAMA_MOE_HOT_SRC)
+            const size_t n = hot.src_nb2[k];
+            ggml_backend_tensor_set(dst[k], hot.src_data[k] + c.cold*n, s*n, n);
+#if !defined(_WIN32) && defined(MADV_PAGEOUT)
+            if (hot.src_other) {
+                const uintptr_t pg = 4096;
+                const uintptr_t a  = (uintptr_t) hot.src_data[k] + (size_t) c.cold*n;
+                const uintptr_t a0 = (a + pg - 1) & ~(pg - 1);
+                const uintptr_t a1 = (a + n) & ~(pg - 1);
+                if (a1 > a0) {
+                    madvise((void *) a0, a1 - a0, MADV_PAGEOUT);
+                }
+            }
+#endif
         }
         hot.slot[c.cold] = s;
         hot.slot[c.hot]  = -1;
